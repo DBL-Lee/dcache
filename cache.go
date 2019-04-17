@@ -38,51 +38,40 @@ type CacheRepository interface {
 	Close()
 }
 
-var (
-	cachableErrorTypes = []errors.CodeType{
-		errors.CodeBarrageNotFound,
-		errors.CodeCategoryNotFound,
-		errors.CodeTagNotFound,
-		errors.CodePostNotFound,
-		errors.CodeVideoNotFound,
-		errors.CodeCommentNotFound,
-		errors.CodeHostNotFound,
-		errors.CodeDonationNotFound,
-		errors.CodeLivestreamNotFound,
-		errors.CodeStreamTemplateNotFound,
-		errors.CodeSubscriptionSettingNotFound,
-		errors.CodeSubscriptionNotFound,
-		errors.CodeRelationshipNotFound,
-	}
-)
-
 // Client captures redis connection
 type Client struct {
-	primaryConn    redis.UniversalClient
-	replicaConn    []redis.UniversalClient
-	promCounter    *prometheus.CounterVec
-	inMemCache     *freecache.Cache
-	pubsub         *redis.PubSub
-	id             string
-	invalidateKeys map[string]struct{}
-	invalidateMu   *sync.Mutex
-	invalidateCh   chan struct{}
+	primaryConn        redis.UniversalClient
+	replicaConn        []redis.UniversalClient
+	promCounter        *prometheus.CounterVec
+	inMemCache         *freecache.Cache
+	pubsub             *redis.PubSub
+	id                 string
+	invalidateKeys     map[string]struct{}
+	invalidateMu       *sync.Mutex
+	invalidateCh       chan struct{}
+	cachableErrorTypes []errors.CodeType
 }
 
 // NewCacheRepo creates a new client for Cache connection
-func NewCacheRepo(primaryClient redis.UniversalClient, replicaClient []redis.UniversalClient,
-	counter *prometheus.CounterVec, inMemCache *freecache.Cache) (CacheRepository, errors.Error) {
+func NewCacheRepo(
+	primaryClient redis.UniversalClient,
+	replicaClient []redis.UniversalClient,
+	counter *prometheus.CounterVec,
+	inMemCache *freecache.Cache,
+	cachableErrorTypes []errors.CodeType,
+) (CacheRepository, errors.Error) {
 	rand.Seed(time.Now().UnixNano())
 	id := uuid.NewV4()
 	c := &Client{
-		primaryConn:    primaryClient,
-		replicaConn:    replicaClient,
-		promCounter:    counter,
-		id:             id.String(),
-		invalidateKeys: make(map[string]struct{}),
-		invalidateMu:   &sync.Mutex{},
-		invalidateCh:   make(chan struct{}),
-		inMemCache:     inMemCache,
+		primaryConn:        primaryClient,
+		replicaConn:        replicaClient,
+		promCounter:        counter,
+		id:                 id.String(),
+		invalidateKeys:     make(map[string]struct{}),
+		invalidateMu:       &sync.Mutex{},
+		invalidateCh:       make(chan struct{}),
+		inMemCache:         inMemCache,
+		cachableErrorTypes: cachableErrorTypes,
 	}
 	if inMemCache != nil {
 		c.pubsub = c.primaryConn.Subscribe(redisCacheInvalidateTopic)
@@ -116,7 +105,7 @@ func (c *Client) getNoCache(queryKey QueryKey, expire time.Duration, f func() (i
 			}
 		}()
 	} else {
-		if shouldCacheError(err) {
+		if c.shouldCacheError(err) {
 			go func() {
 				cacheErr := cacheError{
 					Code: err.CodeType(),
@@ -381,8 +370,8 @@ func (c *Client) SetWithWriteBack(writeBack map[QueryKey]CacheWriteBack, f func(
 	return res, err
 }
 
-func shouldCacheError(err errors.Error) bool {
-	for _, t := range cachableErrorTypes {
+func (c *Client) shouldCacheError(err errors.Error) bool {
+	for _, t := range c.cachableErrorTypes {
 		if t == err.CodeType() {
 			return true
 		}

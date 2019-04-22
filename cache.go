@@ -254,11 +254,10 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 				return c.getNoCache(ctx, queryKey, expire, f)
 			}
 			// Did not obtain lock, sleep and retry to wait for update
-		wait:
 			for {
 				select {
 				case <-ctx.Done():
-					break wait
+					return nil, errors.NewErrorf(errors.CodeRequestTimeout, "timeout")
 				case <-time.After(minSleep):
 					res, e = readConn.Get(store(queryKey)).Result()
 					if e != nil {

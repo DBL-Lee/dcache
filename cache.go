@@ -332,8 +332,7 @@ func (c *Client) Set(invalidateKeys []QueryKey, f func() (interface{}, errors.Er
 				}
 			}
 			for _, k := range invalidateKeys {
-				c.primaryConn.Del(string(k))
-				c.broadcastKeyInvalidate(k)
+				c.deleteKey(k)
 			}
 		}()
 	}

@@ -2,6 +2,7 @@ package cache
 
 import (
 	"bytes"
+	"context"
 	"encoding/gob"
 	"math/rand"
 	"reflect"
@@ -19,6 +20,8 @@ import (
 
 const (
 	TTLSuffix                 = "_TTL"
+	lockSuffix                = "_LOCK"
+	minSleep                  = 50 * time.Millisecond
 	MaxCacheTime              = time.Hour
 	inMemCacheTime            = time.Second * 2
 	redisCacheInvalidateTopic = "CacheInvalidatePubSub"
@@ -31,10 +34,12 @@ type cacheError struct {
 	Msg  string          `json:"msg"`
 }
 
+type ReadThroughFunc func() (interface{}, errors.Error)
+
 type CacheRepository interface {
-	Get(queryKey QueryKey, target interface{}, expire time.Duration, f func() (interface{}, errors.Error), noCache bool) (interface{}, errors.Error)
-	Set(invalidateKeys []QueryKey, f func() (interface{}, errors.Error), block *[]chan struct{}) (interface{}, errors.Error)
-	SetWithWriteBack(writeBack map[QueryKey]CacheWriteBack, f func() (interface{}, errors.Error), block *[]chan struct{}) (interface{}, errors.Error)
+	Get(ctx context.Context, queryKey QueryKey, target interface{}, expire time.Duration, f ReadThroughFunc, noCache bool) (interface{}, errors.Error)
+	Set(ctx context.Context, invalidateKeys []QueryKey, f ReadThroughFunc, block *[]chan struct{}) (interface{}, errors.Error)
+	SetWithWriteBack(ctx context.Context, writeBack map[QueryKey]CacheWriteBack, f ReadThroughFunc, block *[]chan struct{}) (interface{}, errors.Error)
 	Close()
 }
 
@@ -90,7 +95,7 @@ func (c *Client) Close() {
 
 type QueryKey string
 
-func (c *Client) getNoCache(queryKey QueryKey, expire time.Duration, f func() (interface{}, errors.Error)) (interface{}, errors.Error) {
+func (c *Client) getNoCache(ctx context.Context, queryKey QueryKey, expire time.Duration, f ReadThroughFunc) (interface{}, errors.Error) {
 	if c.promCounter != nil {
 		c.promCounter.WithLabelValues("MISS").Inc()
 	}
@@ -216,18 +221,20 @@ func store(key QueryKey) string {
 	return "{" + string(key) + "}"
 }
 
+func lock(key QueryKey) string {
+	return store(key) + lockSuffix
+}
+
 func ttl(key QueryKey) string {
 	return store(key) + TTLSuffix
 }
 
-func (c *Client) Get(queryKey QueryKey, target interface{}, expire time.Duration, f func() (interface{}, errors.Error), noCache bool) (interface{}, errors.Error) {
-	// // Temporarily disable cache for testing
-	// return c.getNoCache(queryKey, expire, f)
+func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{}, expire time.Duration, f ReadThroughFunc, noCache bool) (interface{}, errors.Error) {
 	if c.promCounter != nil {
 		c.promCounter.WithLabelValues("TOTAL").Inc()
 	}
 	if noCache {
-		return c.getNoCache(queryKey, expire, f)
+		return c.getNoCache(ctx, queryKey, expire, f)
 	}
 	readConn := c.primaryConn
 	if len(c.replicaConn) > 0 {
@@ -241,7 +248,24 @@ func (c *Client) Get(queryKey QueryKey, target interface{}, expire time.Duration
 	if bRes == nil {
 		res, e := readConn.Get(store(queryKey)).Result()
 		if e != nil {
-			return c.getNoCache(queryKey, expire, f)
+			// Empty cache, obtain lock first to query db
+			updated, _ := c.primaryConn.SetNX(lock(queryKey), "", time.Second*5).Result()
+			if updated {
+				return c.getNoCache(ctx, queryKey, expire, f)
+			}
+			// Did not obtain lock, sleep and retry to wait for update
+		wait:
+			for {
+				select {
+				case <-ctx.Done():
+					break wait
+				case <-time.After(minSleep):
+					res, e = readConn.Get(store(queryKey)).Result()
+					if e != nil {
+						continue
+					}
+				}
+			}
 		}
 		bRes = []byte(res)
 
@@ -250,14 +274,14 @@ func (c *Client) Get(queryKey QueryKey, target interface{}, expire time.Duration
 		t, e := readConn.TTL(ttl(queryKey)).Result()
 		if e != nil {
 			// Random redis error
-			return c.getNoCache(queryKey, expire, f)
+			return c.getNoCache(ctx, queryKey, expire, f)
 		}
 		if int(t/time.Second) == -2 {
 			// Key has expired, try to grab update lock
 			updated, _ := c.primaryConn.SetNX(ttl(queryKey), "", expire).Result()
 			if updated {
 				// Got update lock
-				return c.getNoCache(queryKey, expire, f)
+				return c.getNoCache(ctx, queryKey, expire, f)
 			}
 			inMemExpire = int(inMemCacheTime / time.Second)
 		} else {
@@ -301,14 +325,14 @@ func (c *Client) Get(queryKey QueryKey, target interface{}, expire time.Duration
 		t := reflect.New(reflect.PtrTo(reflect.TypeOf(target)))
 		e = dec.Decode(t.Interface())
 		if e != nil {
-			return c.getNoCache(queryKey, expire, f)
+			return c.getNoCache(ctx, queryKey, expire, f)
 		}
 		// Dereference and return the underlying target
 		return t.Elem().Elem().Interface(), nil
 	}
 	e = dec.Decode(target)
 	if e != nil {
-		return c.getNoCache(queryKey, expire, f)
+		return c.getNoCache(ctx, queryKey, expire, f)
 	}
 	// Use reflect to dereference an interface if it is pointer to array.
 	// Should always be slice instead of array, but just in case.
@@ -318,7 +342,7 @@ func (c *Client) Get(queryKey QueryKey, target interface{}, expire time.Duration
 	return target, nil
 }
 
-func (c *Client) Set(invalidateKeys []QueryKey, f func() (interface{}, errors.Error), block *[]chan struct{}) (interface{}, errors.Error) {
+func (c *Client) Set(ctx context.Context, invalidateKeys []QueryKey, f ReadThroughFunc, block *[]chan struct{}) (interface{}, errors.Error) {
 	// if cond is passed, the process waits until cond is true before invalidating keys
 	res, err := f()
 	if err == nil {
@@ -349,7 +373,7 @@ type CacheWriteBack struct {
 	Expire time.Duration
 }
 
-func (c *Client) SetWithWriteBack(writeBack map[QueryKey]CacheWriteBack, f func() (interface{}, errors.Error), block *[]chan struct{}) (interface{}, errors.Error) {
+func (c *Client) SetWithWriteBack(ctx context.Context, writeBack map[QueryKey]CacheWriteBack, f ReadThroughFunc, block *[]chan struct{}) (interface{}, errors.Error) {
 	res, err := f()
 	if err == nil {
 		go func() {
@@ -366,7 +390,7 @@ func (c *Client) SetWithWriteBack(writeBack map[QueryKey]CacheWriteBack, f func(
 				}
 			}
 			for k, v := range writeBack {
-				c.getNoCache(k, v.Expire, func() (interface{}, errors.Error) { return v.Value, v.Err })
+				c.getNoCache(ctx, k, v.Expire, func() (interface{}, errors.Error) { return v.Value, v.Err })
 			}
 		}()
 	}

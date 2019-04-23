@@ -52,16 +52,17 @@ type CacheRepository interface {
 
 // Client captures redis connection
 type Client struct {
-	primaryConn        redis.UniversalClient
-	replicaConn        []redis.UniversalClient
-	promCounter        *prometheus.CounterVec
-	inMemCache         *freecache.Cache
-	pubsub             *redis.PubSub
-	id                 string
-	invalidateKeys     map[string]struct{}
-	invalidateMu       *sync.Mutex
-	invalidateCh       chan struct{}
-	cachableErrorTypes []errors.CodeType
+	primaryConn            redis.UniversalClient
+	replicaConn            []redis.UniversalClient
+	promCounter            *prometheus.CounterVec
+	inMemCache             *freecache.Cache
+	pubsub                 *redis.PubSub
+	id                     string
+	invalidateKeys         map[string]struct{}
+	invalidateMu           *sync.Mutex
+	invalidateCh           chan struct{}
+	cachableErrorTypes     []errors.CodeType
+	readThroughPerKeyLimit time.Duration
 }
 
 // NewCacheRepo creates a new client for Cache connection
@@ -71,19 +72,21 @@ func NewCacheRepo(
 	counter *prometheus.CounterVec,
 	inMemCache *freecache.Cache,
 	cachableErrorTypes []errors.CodeType,
+	readThroughPerKeyLimit time.Duration,
 ) (CacheRepository, errors.Error) {
 	rand.Seed(nowFunc().UnixNano())
 	id := uuid.NewV4()
 	c := &Client{
-		primaryConn:        primaryClient,
-		replicaConn:        replicaClient,
-		promCounter:        counter,
-		id:                 id.String(),
-		invalidateKeys:     make(map[string]struct{}),
-		invalidateMu:       &sync.Mutex{},
-		invalidateCh:       make(chan struct{}),
-		inMemCache:         inMemCache,
-		cachableErrorTypes: cachableErrorTypes,
+		primaryConn:            primaryClient,
+		replicaConn:            replicaClient,
+		promCounter:            counter,
+		id:                     id.String(),
+		invalidateKeys:         make(map[string]struct{}),
+		invalidateMu:           &sync.Mutex{},
+		invalidateCh:           make(chan struct{}),
+		inMemCache:             inMemCache,
+		cachableErrorTypes:     cachableErrorTypes,
+		readThroughPerKeyLimit: readThroughPerKeyLimit,
 	}
 	if inMemCache != nil {
 		c.pubsub = c.primaryConn.Subscribe(redisCacheInvalidateTopic)
@@ -254,6 +257,7 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 	}
 	if bRes == nil {
 		var res, ttlRes string
+	retry:
 		resList, e := readConn.MGet(store(queryKey), ttl(queryKey)).Result()
 		if e == nil {
 			if len(resList) != 2 {
@@ -269,23 +273,17 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 		}
 		if e != nil || resList[0] == nil {
 			// Empty cache, obtain lock first to query db
-			updated, _ := c.primaryConn.SetNX(lock(queryKey), "", time.Second*5).Result()
+			// If timeout or not cacheable error, another thread will obtain lock after ratelimit
+			updated, _ := c.primaryConn.SetNX(lock(queryKey), "", c.readThroughPerKeyLimit).Result()
 			if updated {
 				return c.getNoCache(ctx, queryKey, expire, f)
 			}
 			// Did not obtain lock, sleep and retry to wait for update
-		wait:
-			for {
-				select {
-				case <-ctx.Done():
-					return nil, errors.NewErrorf(errors.CodeRequestTimeout, "timeout")
-				case <-time.After(minSleep):
-					res, e = readConn.Get(store(queryKey)).Result()
-					if e != nil {
-						continue
-					}
-					break wait
-				}
+			select {
+			case <-ctx.Done():
+				return nil, errors.NewErrorf(errors.CodeRequestTimeout, "timeout")
+			case <-time.After(minSleep):
+				goto retry
 			}
 		}
 		bRes = []byte(res)
@@ -329,10 +327,15 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 	dec := gob.NewDecoder(bytes.NewBuffer(bRes))
 	e := dec.Decode(cachedErr)
 	if e == nil && !cachedErr.isEmpty() {
+		l := strings.Split(cachedErr.Msg, ":")
+		if len(l) > 1 {
+			cachedErr.Msg = strings.Join(l[1:], ":")
+		}
 		// Cast the ret to the nil pointer of same type if it is a pointer
 		retReflect := reflect.ValueOf(target)
 		if retReflect.Kind() == reflect.Ptr {
 			value := reflect.New(retReflect.Type())
+
 			return value.Elem().Interface(), errors.NewError(cachedErr.Code, cachedErr.Msg)
 		}
 		return target, errors.NewError(cachedErr.Code, cachedErr.Msg)

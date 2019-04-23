@@ -128,29 +128,29 @@ func (c *Client) getNoCache(queryKey QueryKey, expire time.Duration, f func() (i
 }
 
 func (c *Client) setKey(queryKey QueryKey, b []byte, expire time.Duration) {
-	if c.primaryConn.Set(string(queryKey), b, MaxCacheTime).Err() == nil {
+	if c.primaryConn.Set(store(queryKey), b, MaxCacheTime).Err() == nil {
 		c.primaryConn.Set(ttl(queryKey), "", expire)
 	}
 	if c.inMemCache != nil {
-		c.inMemCache.Set([]byte(string(queryKey)), b, int(expire/time.Second))
+		c.inMemCache.Set([]byte(store(queryKey)), b, int(expire/time.Second))
 		c.broadcastKeyInvalidate(queryKey)
 	}
 }
 
 func (c *Client) deleteKey(queryKey QueryKey) {
-	if e := c.primaryConn.Get(string(queryKey)).Err(); e != redis.Nil {
+	if e := c.primaryConn.Get(store(queryKey)).Err(); e != redis.Nil {
 		// Delete key if error should not be cached
-		c.primaryConn.Del(string(queryKey), ttl(queryKey))
+		c.primaryConn.Del(store(queryKey), ttl(queryKey))
 	}
 	if c.inMemCache != nil {
-		c.inMemCache.Del([]byte(string(queryKey)))
+		c.inMemCache.Del([]byte(store(queryKey)))
 		c.broadcastKeyInvalidate(queryKey)
 	}
 }
 
 func (c *Client) broadcastKeyInvalidate(queryKey QueryKey) {
 	c.invalidateMu.Lock()
-	c.invalidateKeys[string(queryKey)] = struct{}{}
+	c.invalidateKeys[store(queryKey)] = struct{}{}
 	l := len(c.invalidateKeys)
 	c.invalidateMu.Unlock()
 	if l == maxInvalidate {
@@ -212,8 +212,12 @@ func (c *Client) listenKeyInvalidate() {
 	}
 }
 
+func store(key QueryKey) string {
+	return "{" + string(key) + "}"
+}
+
 func ttl(key QueryKey) string {
-	return string(key) + TTLSuffix
+	return store(key) + TTLSuffix
 }
 
 func (c *Client) Get(queryKey QueryKey, target interface{}, expire time.Duration, f func() (interface{}, errors.Error), noCache bool) (interface{}, errors.Error) {
@@ -232,10 +236,10 @@ func (c *Client) Get(queryKey QueryKey, target interface{}, expire time.Duration
 
 	var bRes []byte
 	if c.inMemCache != nil {
-		bRes, _ = c.inMemCache.Get([]byte(string(queryKey)))
+		bRes, _ = c.inMemCache.Get([]byte(store(queryKey)))
 	}
 	if bRes == nil {
-		res, e := readConn.Get(string(queryKey)).Result()
+		res, e := readConn.Get(store(queryKey)).Result()
 		if e != nil {
 			return c.getNoCache(queryKey, expire, f)
 		}
@@ -261,7 +265,7 @@ func (c *Client) Get(queryKey QueryKey, target interface{}, expire time.Duration
 		}
 		// Populate inMemCache
 		if c.inMemCache != nil && inMemExpire > 0 {
-			c.inMemCache.Set([]byte(string(queryKey)), bRes, inMemExpire)
+			c.inMemCache.Set([]byte(store(queryKey)), bRes, inMemExpire)
 		}
 		if c.promCounter != nil {
 			c.promCounter.WithLabelValues("REDIS HIT").Inc()

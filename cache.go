@@ -138,7 +138,7 @@ func (c *Client) setKey(queryKey QueryKey, b []byte, expire time.Duration) {
 }
 
 func (c *Client) deleteKey(queryKey QueryKey) {
-	if exist, _ := c.primaryConn.Exists(string(queryKey)).Result(); exist == 1 {
+	if e := c.primaryConn.Get(string(queryKey)).Err(); e != redis.Nil {
 		// Delete key if error should not be cached
 		c.primaryConn.Del(string(queryKey), ttl(queryKey))
 	}

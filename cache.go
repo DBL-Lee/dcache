@@ -6,6 +6,7 @@ import (
 	"encoding/gob"
 	"math/rand"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -28,6 +29,12 @@ const (
 	maxInvalidate             = 100
 	delimiter                 = "~|~"
 )
+
+var (
+	nowFunc = time.Now
+)
+
+func SetNowFunc(f func() time.Time) { nowFunc = f }
 
 type cacheError struct {
 	Code errors.CodeType `json:"code"`
@@ -65,7 +72,7 @@ func NewCacheRepo(
 	inMemCache *freecache.Cache,
 	cachableErrorTypes []errors.CodeType,
 ) (CacheRepository, errors.Error) {
-	rand.Seed(time.Now().UnixNano())
+	rand.Seed(nowFunc().UnixNano())
 	id := uuid.NewV4()
 	c := &Client{
 		primaryConn:        primaryClient,
@@ -134,7 +141,7 @@ func (c *Client) getNoCache(ctx context.Context, queryKey QueryKey, expire time.
 
 func (c *Client) setKey(queryKey QueryKey, b []byte, expire time.Duration) {
 	if c.primaryConn.Set(store(queryKey), b, MaxCacheTime).Err() == nil {
-		c.primaryConn.Set(ttl(queryKey), "", expire)
+		c.primaryConn.Set(ttl(queryKey), strconv.FormatInt(nowFunc().UTC().Add(expire).Unix(), 10), expire)
 	}
 	if c.inMemCache != nil {
 		c.inMemCache.Set([]byte(store(queryKey)), b, int(expire/time.Second))
@@ -246,14 +253,28 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 		bRes, _ = c.inMemCache.Get([]byte(store(queryKey)))
 	}
 	if bRes == nil {
-		res, e := readConn.Get(store(queryKey)).Result()
-		if e != nil {
+		var res, ttlRes string
+		resList, e := readConn.MGet(store(queryKey), ttl(queryKey)).Result()
+		if e == nil {
+			if len(resList) != 2 {
+				// Should never happen
+				return nil, errors.NewErrorf(errors.CodeRedisFailedToGet, "get list %s not len 2", resList)
+			}
+			if resList[0] != nil {
+				res, _ = resList[0].(string)
+			}
+			if resList[1] != nil {
+				ttlRes, _ = resList[1].(string)
+			}
+		}
+		if e != nil || resList[0] == nil {
 			// Empty cache, obtain lock first to query db
 			updated, _ := c.primaryConn.SetNX(lock(queryKey), "", time.Second*5).Result()
 			if updated {
 				return c.getNoCache(ctx, queryKey, expire, f)
 			}
 			// Did not obtain lock, sleep and retry to wait for update
+		wait:
 			for {
 				select {
 				case <-ctx.Done():
@@ -263,6 +284,7 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 					if e != nil {
 						continue
 					}
+					break wait
 				}
 			}
 		}
@@ -270,21 +292,21 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 
 		var inMemExpire int
 		// Tries to update ttl key if it doesn't exist
-		t, e := readConn.TTL(ttl(queryKey)).Result()
-		if e != nil {
-			// Random redis error
-			return c.getNoCache(ctx, queryKey, expire, f)
-		}
-		if int(t/time.Second) == -2 {
+		if ttlRes == "" {
 			// Key has expired, try to grab update lock
-			updated, _ := c.primaryConn.SetNX(ttl(queryKey), "", expire).Result()
+			updated, _ := c.primaryConn.SetNX(ttl(queryKey), strconv.FormatInt(nowFunc().UTC().Add(expire).Unix(), 10), expire).Result()
 			if updated {
 				// Got update lock
 				return c.getNoCache(ctx, queryKey, expire, f)
 			}
 			inMemExpire = int(inMemCacheTime / time.Second)
 		} else {
-			inMemExpire = int(t / time.Second)
+			// ttlRes should be unix time of expireAt
+			t, e := strconv.ParseInt(ttlRes, 10, 64)
+			if e != nil {
+				t = nowFunc().UTC().Add(inMemCacheTime).Unix()
+			}
+			inMemExpire = int(t - nowFunc().UTC().Unix())
 		}
 		// Populate inMemCache
 		if c.inMemCache != nil && inMemExpire > 0 {

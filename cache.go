@@ -239,6 +239,17 @@ func ttl(key QueryKey) string {
 	return store(key) + TTLSuffix
 }
 
+func returnError(target interface{}, err errors.Error) (interface{}, errors.Error) {
+	// Cast the ret to the nil pointer of same type if it is a pointer
+	retReflect := reflect.ValueOf(target)
+	if retReflect.Kind() == reflect.Ptr {
+		value := reflect.New(retReflect.Type())
+
+		return value.Elem().Interface(), err
+	}
+	return target, err
+}
+
 func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{}, expire time.Duration, f ReadThroughFunc, noCache bool) (interface{}, errors.Error) {
 	if c.promCounter != nil {
 		c.promCounter.WithLabelValues("TOTAL").Inc()
@@ -262,7 +273,7 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 		if e == nil {
 			if len(resList) != 2 {
 				// Should never happen
-				return nil, errors.NewErrorf(errors.CodeRedisFailedToGet, "get list %s not len 2", resList)
+				return returnError(target, errors.NewErrorf(errors.CodeRedisFailedToGet, "get list %s not len 2", resList))
 			}
 			if resList[0] != nil {
 				res, _ = resList[0].(string)
@@ -281,7 +292,7 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 			// Did not obtain lock, sleep and retry to wait for update
 			select {
 			case <-ctx.Done():
-				return nil, errors.NewErrorf(errors.CodeRequestTimeout, "timeout")
+				return returnError(target, errors.NewErrorf(errors.CodeRequestTimeout, "timeout"))
 			case <-time.After(minSleep):
 				goto retry
 			}
@@ -331,14 +342,7 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 		if len(l) > 1 {
 			cachedErr.Msg = strings.Join(l[1:], ":")
 		}
-		// Cast the ret to the nil pointer of same type if it is a pointer
-		retReflect := reflect.ValueOf(target)
-		if retReflect.Kind() == reflect.Ptr {
-			value := reflect.New(retReflect.Type())
-
-			return value.Elem().Interface(), errors.NewError(cachedErr.Code, cachedErr.Msg)
-		}
-		return target, errors.NewError(cachedErr.Code, cachedErr.Msg)
+		return returnError(target, errors.NewError(cachedErr.Code, cachedErr.Msg))
 	}
 
 	// check for actual value
@@ -357,11 +361,6 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 	e = dec.Decode(target)
 	if e != nil {
 		return c.getNoCache(ctx, queryKey, expire, f)
-	}
-	// Use reflect to dereference an interface if it is pointer to array.
-	// Should always be slice instead of array, but just in case.
-	if value.Elem().Type().Kind() == reflect.Slice || value.Elem().Type().Kind() == reflect.Array {
-		return reflect.ValueOf(target).Elem().Interface(), nil
 	}
 	return target, nil
 }

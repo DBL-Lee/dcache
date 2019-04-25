@@ -179,31 +179,6 @@ func (suite *testSuite) TestPopulateCache() {
 	suite.Equal(v, suite.decodeByte(vinmem2, v))
 }
 
-func (suite *testSuite) TestCachingArray() {
-	queryKey := QueryKey("test")
-	v := []string{"testvalue", "testvalue2", "testvalue3"}
-	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
-	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, &v, Normal.ToDuration(), func() (interface{}, errors.Error) {
-		return suite.mockRepo.ReadThrough()
-	}, false)
-	suite.NoError(err)
-	suite.Equal(v, vget)
-
-	// Second call should not hit db
-	vget, err = suite.cacheRepo.Get(context.Background(), queryKey, &v, Normal.ToDuration(), func() (interface{}, errors.Error) {
-		return suite.mockRepo.ReadThrough()
-	}, false)
-	suite.NoError(err)
-	suite.Equal(v, vget)
-
-	vredis := suite.redisConn.Get(store(queryKey)).Val()
-	suite.Equal(v, suite.decodeByte([]byte(vredis), v))
-
-	vinmem, e := suite.inMemCache.Get([]byte(store(queryKey)))
-	suite.NoError(e)
-	suite.Equal(v, suite.decodeByte(vinmem, v))
-}
-
 func (suite *testSuite) TestCachingError() {
 	queryKey := QueryKey("test")
 	type a struct{}
@@ -290,12 +265,72 @@ func (suite *testSuite) TestConcurrentReadWaitTimeout() {
 	ctx, cancel := context.WithCancel(context.Background())
 	// cancel the context
 	cancel()
-	_, err := suite.cacheRepo2.Get(ctx, queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	s, err := suite.cacheRepo2.Get(ctx, queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	// Should get timeout error
 	suite.Error(err)
+	// Should not panic
+	_ = s.(string)
 	wg.Wait()
+}
+
+type Dummy struct {
+	A int
+	B int
+}
+
+func (suite *testSuite) TestCacheDifferentType() {
+	for i, v := range []interface{}{
+		"abc",
+		134,
+		true,
+		Dummy{A: 111, B: 23},
+		&Dummy{A: 209, B: 923},
+		[]*Dummy{&Dummy{A: 13}, &Dummy{B: 2332}, &Dummy{A: 13, B: 8921384}},
+		&[]*Dummy{&Dummy{A: 1113}, &Dummy{B: 232332}, &Dummy{A: 1253, B: 4}},
+	} {
+		queryKey := QueryKey(fmt.Sprintf("test%d", i))
+		suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
+		vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+			return suite.mockRepo.ReadThrough()
+		}, false)
+		suite.NoError(err)
+		suite.EqualValues(v, vget)
+
+		// Second call should not hit db
+		vget, err = suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+			return suite.mockRepo.ReadThrough()
+		}, false)
+		suite.NoError(err)
+		suite.EqualValues(v, vget)
+	}
+}
+
+func (suite *testSuite) TestZeroValueErrorReturn() {
+	str := "empty"
+	strret, _ := returnError(str, errors.NewErrorf(errors.CodeAPIError, "any"))
+	_ = strret.(string)
+
+	i := 123
+	iret, _ := returnError(i, errors.NewErrorf(errors.CodeAPIError, "any"))
+	_ = iret.(int)
+
+	b := true
+	bret, _ := returnError(b, errors.NewErrorf(errors.CodeAPIError, "any"))
+	_ = bret.(bool)
+
+	obj := time.Time{}
+	objret, _ := returnError(obj, errors.NewErrorf(errors.CodeAPIError, "any"))
+	_ = objret.(time.Time)
+
+	objptr := &time.Time{}
+	objptrret, _ := returnError(objptr, errors.NewErrorf(errors.CodeAPIError, "any"))
+	_ = objptrret.(*time.Time)
+
+	list := []*time.Time{}
+	listret, _ := returnError(list, errors.NewErrorf(errors.CodeAPIError, "any"))
+	_ = listret.([]*time.Time)
 }
 
 func (suite *testSuite) TestConcurrentReadAfterExpire() {
@@ -312,7 +347,7 @@ func (suite *testSuite) TestConcurrentReadAfterExpire() {
 	var wg sync.WaitGroup
 
 	// Wait for expire
-	time.Sleep(time.Second * 1)
+	time.Sleep(time.Second * 2)
 	// Change return
 	newv := "testvaluenew"
 	suite.mockRepo.On("ReadThrough").Return(newv, nil).Once()

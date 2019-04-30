@@ -262,6 +262,8 @@ func (suite *testSuite) TestCacheDifferentType() {
 		&Dummy{A: 209, B: 923},
 		[]*Dummy{&Dummy{A: 13}, &Dummy{B: 2332}, &Dummy{A: 13, B: 8921384}},
 		&[]*Dummy{&Dummy{A: 1113}, &Dummy{B: 232332}, &Dummy{A: 1253, B: 4}},
+		(*Dummy)(nil),
+		nil,
 	} {
 		queryKey := QueryKey(fmt.Sprintf("test%d", i))
 		suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
@@ -282,27 +284,28 @@ func (suite *testSuite) TestCacheDifferentType() {
 
 func (suite *testSuite) TestZeroValueErrorReturn() {
 	str := "empty"
-	strret, _ := returnError(str, errors.New("test"))
+	e := errors.New("test")
+	strret, _ := returnNil(str, e)
 	_ = strret.(string)
 
 	i := 123
-	iret, _ := returnError(i, errors.New("test"))
+	iret, _ := returnNil(i, e)
 	_ = iret.(int)
 
 	b := true
-	bret, _ := returnError(b, errors.New("test"))
+	bret, _ := returnNil(b, e)
 	_ = bret.(bool)
 
 	obj := time.Time{}
-	objret, _ := returnError(obj, errors.New("test"))
+	objret, _ := returnNil(obj, e)
 	_ = objret.(time.Time)
 
 	objptr := &time.Time{}
-	objptrret, _ := returnError(objptr, errors.New("test"))
+	objptrret, _ := returnNil(objptr, e)
 	_ = objptrret.(*time.Time)
 
 	list := []*time.Time{}
-	listret, _ := returnError(list, errors.New("test"))
+	listret, _ := returnNil(list, e)
 	_ = listret.([]*time.Time)
 }
 

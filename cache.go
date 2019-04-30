@@ -120,7 +120,11 @@ func (c *Client) Close() {
 }
 
 // QueryKey is an alias to string
-type QueryKey string
+type QueryKey = string
+
+type nilPlaceholder struct {
+	SomeRandomFieldToPreventDecoding struct{}
+}
 
 // getNoCache read through using f and populate cache if no error
 func (c *Client) getNoCache(ctx context.Context, queryKey QueryKey, expire time.Duration, f PassThroughFunc) (interface{}, error) {
@@ -132,7 +136,13 @@ func (c *Client) getNoCache(ctx context.Context, queryKey QueryKey, expire time.
 		if err == nil {
 			var buf bytes.Buffer
 			enc := gob.NewEncoder(&buf)
-			e := enc.Encode(dbres)
+			var e error
+			v := reflect.ValueOf(dbres)
+			if dbres == nil || v.Kind() == reflect.Ptr && v.IsNil() {
+				e = enc.Encode(&nilPlaceholder{})
+			} else {
+				e = enc.Encode(dbres)
+			}
 			if e == nil {
 				c.setKey(queryKey, buf.Bytes(), expire)
 			}
@@ -235,7 +245,7 @@ func (c *Client) listenKeyInvalidate() {
 }
 
 func store(key QueryKey) string {
-	return "{" + string(key) + "}"
+	return "{" + key + "}"
 }
 
 func lock(key QueryKey) string {
@@ -246,15 +256,14 @@ func ttl(key QueryKey) string {
 	return store(key) + ttlSuffix
 }
 
-// returnError cast the ret to the nil pointer of same type if it is a pointer
-func returnError(target interface{}, err error) (interface{}, error) {
+// nil cast the ret to the nil pointer of same type if it is a pointer
+func nil(target interface{}) interface{} {
 	retReflect := reflect.ValueOf(target)
 	if retReflect.Kind() == reflect.Ptr {
 		value := reflect.New(retReflect.Type())
-
-		return value.Elem().Interface(), err
+		return value.Elem().Interface()
 	}
-	return target, err
+	return target
 }
 
 // Get implements Cache interface
@@ -282,7 +291,7 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 		if e == nil {
 			if len(resList) != 2 {
 				// Should never happen
-				return returnError(target, ErrInternal)
+				return nil(target), ErrInternal
 			}
 			if resList[0] != nil {
 				res, _ = resList[0].(string)
@@ -301,7 +310,7 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 			// Did not obtain lock, sleep and retry to wait for update
 			select {
 			case <-ctx.Done():
-				return returnError(target, ErrTimeout)
+				return nil(target), ErrTimeout
 			case <-time.After(minSleep):
 				goto retry
 			}
@@ -342,8 +351,15 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 		c.promCounter.WithLabelValues("HIT").Inc()
 	}
 
-	// check for actual value
+	cachedNil := &nilPlaceholder{}
 	dec := gob.NewDecoder(bytes.NewBuffer(bRes))
+	e := dec.Decode(cachedNil)
+	if e == nil {
+		return nil(target, nil)
+	}
+
+	// check for actual value
+	dec = gob.NewDecoder(bytes.NewBuffer(bRes))
 	value := reflect.ValueOf(target)
 	if value.Kind() != reflect.Ptr {
 		// If target is not a pointer, create a pointer of target type and decode to it
@@ -356,7 +372,7 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 		return t.Elem().Elem().Interface(), nil
 	}
 	// target is a pointer, decode directly
-	e := dec.Decode(target)
+	e = dec.Decode(target)
 	if e != nil {
 		return c.getNoCache(ctx, queryKey, expire, f)
 	}

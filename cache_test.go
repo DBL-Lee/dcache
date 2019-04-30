@@ -284,28 +284,27 @@ func (suite *testSuite) TestCacheDifferentType() {
 
 func (suite *testSuite) TestZeroValueErrorReturn() {
 	str := "empty"
-	e := errors.New("test")
-	strret, _ := returnNil(str, e)
+	strret := typedNil(str)
 	_ = strret.(string)
 
 	i := 123
-	iret, _ := returnNil(i, e)
+	iret := typedNil(i)
 	_ = iret.(int)
 
 	b := true
-	bret, _ := returnNil(b, e)
+	bret := typedNil(b)
 	_ = bret.(bool)
 
 	obj := time.Time{}
-	objret, _ := returnNil(obj, e)
+	objret := typedNil(obj)
 	_ = objret.(time.Time)
 
 	objptr := &time.Time{}
-	objptrret, _ := returnNil(objptr, e)
+	objptrret := typedNil(objptr)
 	_ = objptrret.(*time.Time)
 
 	list := []*time.Time{}
-	listret, _ := returnNil(list, e)
+	listret := typedNil(list)
 	_ = listret.([]*time.Time)
 }
 

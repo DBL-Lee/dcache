@@ -256,8 +256,8 @@ func ttl(key QueryKey) string {
 	return store(key) + ttlSuffix
 }
 
-// nil cast the ret to the nil pointer of same type if it is a pointer
-func nil(target interface{}) interface{} {
+// typedNil cast the ret to the nil pointer of same type if it is a pointer
+func typedNil(target interface{}) interface{} {
 	retReflect := reflect.ValueOf(target)
 	if retReflect.Kind() == reflect.Ptr {
 		value := reflect.New(retReflect.Type())
@@ -291,7 +291,7 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 		if e == nil {
 			if len(resList) != 2 {
 				// Should never happen
-				return nil(target), ErrInternal
+				return typedNil(target), ErrInternal
 			}
 			if resList[0] != nil {
 				res, _ = resList[0].(string)
@@ -310,7 +310,7 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 			// Did not obtain lock, sleep and retry to wait for update
 			select {
 			case <-ctx.Done():
-				return nil(target), ErrTimeout
+				return typedNil(target), ErrTimeout
 			case <-time.After(minSleep):
 				goto retry
 			}
@@ -355,7 +355,7 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 	dec := gob.NewDecoder(bytes.NewBuffer(bRes))
 	e := dec.Decode(cachedNil)
 	if e == nil {
-		return nil(target, nil)
+		return typedNil(target), nil
 	}
 
 	// check for actual value

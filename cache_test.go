@@ -365,7 +365,7 @@ func (suite *testSuite) TestSet() {
 
 	newv := "testvaluenew"
 	suite.mockRepo.On("WriteThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.Set(context.Background(), []QueryKey{queryKey}, func() (interface{}, error) {
+	vget, err = suite.cacheRepo.Set(context.Background(), map[QueryKey]*CacheWriteBack{queryKey: nil}, func() (interface{}, error) {
 		return suite.mockRepo.WriteThrough()
 	}, nil)
 	suite.NoError(err)
@@ -402,7 +402,7 @@ func (suite *testSuite) TestSetWithBlockChan() {
 
 	newv := "testvaluenew"
 	suite.mockRepo.On("WriteThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.Set(context.Background(), []QueryKey{queryKey}, func() (interface{}, error) {
+	vget, err = suite.cacheRepo.Set(context.Background(), map[QueryKey]*CacheWriteBack{queryKey: nil}, func() (interface{}, error) {
 		return suite.mockRepo.WriteThrough()
 	}, &blockchan)
 	suite.NoError(err)
@@ -446,9 +446,9 @@ func (suite *testSuite) TestSetWithWriteBack() {
 
 	newv := "testvaluenew"
 	suite.mockRepo.On("WriteThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.SetWithWriteBack(context.Background(),
-		map[QueryKey]CacheWriteBack{
-			queryKey: CacheWriteBack{
+	vget, err = suite.cacheRepo.Set(context.Background(),
+		map[QueryKey]*CacheWriteBack{
+			queryKey: &CacheWriteBack{
 				Value:  newv,
 				Expire: Normal.ToDuration(),
 			},
@@ -489,9 +489,9 @@ func (suite *testSuite) TestSetWithWriteBackWithBlockChan() {
 
 	newv := "testvaluenew"
 	suite.mockRepo.On("WriteThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.SetWithWriteBack(context.Background(),
-		map[QueryKey]CacheWriteBack{
-			queryKey: CacheWriteBack{
+	vget, err = suite.cacheRepo.Set(context.Background(),
+		map[QueryKey]*CacheWriteBack{
+			queryKey: &CacheWriteBack{
 				Value:  newv,
 				Expire: Normal.ToDuration(),
 			},
@@ -552,7 +552,7 @@ func (suite *testSuite) TestInvalidateKeyAcrossPods() {
 
 	newv := "testvaluenew"
 	suite.mockRepo.On("WriteThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.Set(context.Background(), []QueryKey{queryKey}, func() (interface{}, error) {
+	vget, err = suite.cacheRepo.Set(context.Background(), map[QueryKey]*CacheWriteBack{queryKey: nil}, func() (interface{}, error) {
 		return suite.mockRepo.WriteThrough()
 	}, nil)
 	suite.NoError(err)

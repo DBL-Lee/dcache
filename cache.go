@@ -44,14 +44,27 @@ var (
 // SetNowFunc is a helper function to replace time.Now()
 func SetNowFunc(f func() time.Time) { nowFunc = f }
 
-// ReadThroughFunc is the actual call to underlying data source
-type ReadThroughFunc func() (interface{}, error)
+// PassThroughFunc is the actual call to underlying data source
+type PassThroughFunc func() (interface{}, error)
 
 // Cache defines interface to cache
 type Cache interface {
-	Get(ctx context.Context, queryKey QueryKey, target interface{}, expire time.Duration, f ReadThroughFunc, noCache bool) (interface{}, error)
-	Set(ctx context.Context, invalidateKeys []QueryKey, f ReadThroughFunc, block *[]chan struct{}) (interface{}, error)
-	SetWithWriteBack(ctx context.Context, writeBack map[QueryKey]CacheWriteBack, f ReadThroughFunc, block *[]chan struct{}) (interface{}, error)
+	// Get returns value of f while caching in redis and inmemcache
+	// Inputs:
+	// queryKey	 - key used in cache
+	// target	 	 - an instance of the same type as the return interface{}
+	// expire 	 - expiration of cache key
+	// f				 - actual call that hits underlying data source
+	// noCache 	 - whether force read from data source
+	Get(ctx context.Context, queryKey QueryKey, target interface{}, expire time.Duration, f PassThroughFunc, noCache bool) (interface{}, error)
+
+	// Set calls f and invalidate or write back cache keys
+	// Inputs:
+	// writeBack		- a map of key to invalidate.
+	//									If value is not nil, the value would be written directly to cache
+	//									Otherwise, the key is simply deleted
+	// f				    - actual call that hits underlying data source
+	Set(ctx context.Context, writeBack map[QueryKey]*CacheWriteBack, f PassThroughFunc, block *[]chan struct{}) (interface{}, error)
 	Close()
 }
 
@@ -110,7 +123,7 @@ func (c *Client) Close() {
 type QueryKey string
 
 // getNoCache read through using f and populate cache if no error
-func (c *Client) getNoCache(ctx context.Context, queryKey QueryKey, expire time.Duration, f ReadThroughFunc) (interface{}, error) {
+func (c *Client) getNoCache(ctx context.Context, queryKey QueryKey, expire time.Duration, f PassThroughFunc) (interface{}, error) {
 	if c.promCounter != nil {
 		c.promCounter.WithLabelValues("MISS").Inc()
 	}
@@ -245,7 +258,7 @@ func returnError(target interface{}, err error) (interface{}, error) {
 }
 
 // Get implements Cache interface
-func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{}, expire time.Duration, f ReadThroughFunc, noCache bool) (interface{}, error) {
+func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{}, expire time.Duration, f PassThroughFunc, noCache bool) (interface{}, error) {
 	if c.promCounter != nil {
 		c.promCounter.WithLabelValues("TOTAL").Inc()
 	}
@@ -350,39 +363,14 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 	return target, nil
 }
 
-// Set implements Cache interface
-func (c *Client) Set(ctx context.Context, invalidateKeys []QueryKey, f ReadThroughFunc, block *[]chan struct{}) (interface{}, error) {
-	// if cond is passed, the process waits until cond is true before invalidating keys
-	res, err := f()
-	if err == nil {
-		go func() {
-			if block != nil {
-				blockchan := make(chan struct{}, 1)
-				*block = append(*block, blockchan)
-				// Wait up to 30 seconds for unblock signal
-				timer := time.NewTimer(30 * time.Second)
-				defer timer.Stop()
-				select {
-				case <-blockchan:
-				case <-timer.C:
-					return
-				}
-			}
-			for _, k := range invalidateKeys {
-				c.deleteKey(k)
-			}
-		}()
-	}
-	return res, err
-}
-
+// CacheWriteBack wraps cache value and cache duration
 type CacheWriteBack struct {
 	Value  interface{}
 	Expire time.Duration
 }
 
-// SetWithWriteBack implements Cache interface
-func (c *Client) SetWithWriteBack(ctx context.Context, writeBack map[QueryKey]CacheWriteBack, f ReadThroughFunc, block *[]chan struct{}) (interface{}, error) {
+// Set implements Cache interface
+func (c *Client) Set(ctx context.Context, writeBack map[QueryKey]*CacheWriteBack, f PassThroughFunc, block *[]chan struct{}) (interface{}, error) {
 	res, err := f()
 	if err == nil {
 		go func() {
@@ -399,7 +387,11 @@ func (c *Client) SetWithWriteBack(ctx context.Context, writeBack map[QueryKey]Ca
 				}
 			}
 			for k, v := range writeBack {
-				c.getNoCache(ctx, k, v.Expire, func() (interface{}, error) { return v.Value, nil })
+				if v != nil {
+					c.getNoCache(ctx, k, v.Expire, func() (interface{}, error) { return v.Value, nil })
+				} else {
+					c.deleteKey(k)
+				}
 			}
 		}()
 	}

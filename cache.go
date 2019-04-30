@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"errors"
 	"math/rand"
 	"reflect"
 	"strconv"
@@ -13,17 +14,16 @@ import (
 
 	"github.com/coocood/freecache"
 	"github.com/go-redis/redis"
-	errors "github.com/lino-network/lino-errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog/log"
 	uuid "github.com/satori/go.uuid"
 )
 
 const (
-	TTLSuffix                 = "_TTL"
+	ttlSuffix                 = "_TTL"
 	lockSuffix                = "_LOCK"
 	minSleep                  = 50 * time.Millisecond
-	MaxCacheTime              = time.Hour
+	maxCacheTime              = time.Hour * 24
 	inMemCacheTime            = time.Second * 2
 	redisCacheInvalidateTopic = "CacheInvalidatePubSub"
 	maxInvalidate             = 100
@@ -34,19 +34,24 @@ var (
 	nowFunc = time.Now
 )
 
+var (
+	// ErrTimeout is timeout error
+	ErrTimeout = errors.New("timeout")
+	// ErrInternal should never happen
+	ErrInternal = errors.New("internal")
+)
+
+// SetNowFunc is a helper function to replace time.Now()
 func SetNowFunc(f func() time.Time) { nowFunc = f }
 
-type cacheError struct {
-	Code errors.CodeType `json:"code"`
-	Msg  string          `json:"msg"`
-}
+// ReadThroughFunc is the actual call to underlying data source
+type ReadThroughFunc func() (interface{}, error)
 
-type ReadThroughFunc func() (interface{}, errors.Error)
-
-type CacheRepository interface {
-	Get(ctx context.Context, queryKey QueryKey, target interface{}, expire time.Duration, f ReadThroughFunc, noCache bool) (interface{}, errors.Error)
-	Set(ctx context.Context, invalidateKeys []QueryKey, f ReadThroughFunc, block *[]chan struct{}) (interface{}, errors.Error)
-	SetWithWriteBack(ctx context.Context, writeBack map[QueryKey]CacheWriteBack, f ReadThroughFunc, block *[]chan struct{}) (interface{}, errors.Error)
+// Cache defines interface to cache
+type Cache interface {
+	Get(ctx context.Context, queryKey QueryKey, target interface{}, expire time.Duration, f ReadThroughFunc, noCache bool) (interface{}, error)
+	Set(ctx context.Context, invalidateKeys []QueryKey, f ReadThroughFunc, block *[]chan struct{}) (interface{}, error)
+	SetWithWriteBack(ctx context.Context, writeBack map[QueryKey]CacheWriteBack, f ReadThroughFunc, block *[]chan struct{}) (interface{}, error)
 	Close()
 }
 
@@ -61,19 +66,17 @@ type Client struct {
 	invalidateKeys         map[string]struct{}
 	invalidateMu           *sync.Mutex
 	invalidateCh           chan struct{}
-	cachableErrorTypes     []errors.CodeType
 	readThroughPerKeyLimit time.Duration
 }
 
-// NewCacheRepo creates a new client for Cache connection
-func NewCacheRepo(
+// NewCache creates a new redis cache with inmem cache
+func NewCache(
 	primaryClient redis.UniversalClient,
 	replicaClient []redis.UniversalClient,
 	counter *prometheus.CounterVec,
 	inMemCache *freecache.Cache,
-	cachableErrorTypes []errors.CodeType,
 	readThroughPerKeyLimit time.Duration,
-) (CacheRepository, errors.Error) {
+) (Cache, error) {
 	rand.Seed(nowFunc().UnixNano())
 	id := uuid.NewV4()
 	c := &Client{
@@ -85,7 +88,6 @@ func NewCacheRepo(
 		invalidateMu:           &sync.Mutex{},
 		invalidateCh:           make(chan struct{}),
 		inMemCache:             inMemCache,
-		cachableErrorTypes:     cachableErrorTypes,
 		readThroughPerKeyLimit: readThroughPerKeyLimit,
 	}
 	if inMemCache != nil {
@@ -96,6 +98,7 @@ func NewCacheRepo(
 	return c, nil
 }
 
+// Close terminates redis pubsub gracefully
 func (c *Client) Close() {
 	if c.pubsub != nil {
 		c.pubsub.Unsubscribe()
@@ -103,47 +106,33 @@ func (c *Client) Close() {
 	}
 }
 
+// QueryKey is an alias to string
 type QueryKey string
 
-func (c *Client) getNoCache(ctx context.Context, queryKey QueryKey, expire time.Duration, f ReadThroughFunc) (interface{}, errors.Error) {
+// getNoCache read through using f and populate cache if no error
+func (c *Client) getNoCache(ctx context.Context, queryKey QueryKey, expire time.Duration, f ReadThroughFunc) (interface{}, error) {
 	if c.promCounter != nil {
 		c.promCounter.WithLabelValues("MISS").Inc()
 	}
 	dbres, err := f()
-	if err == nil {
-		go func() {
+	go func() {
+		if err == nil {
 			var buf bytes.Buffer
 			enc := gob.NewEncoder(&buf)
 			e := enc.Encode(dbres)
 			if e == nil {
 				c.setKey(queryKey, buf.Bytes(), expire)
 			}
-		}()
-	} else {
-		if c.shouldCacheError(err) {
-			go func() {
-				cacheErr := cacheError{
-					Code: err.CodeType(),
-					Msg:  err.Error(),
-				}
-				var buf bytes.Buffer
-				enc := gob.NewEncoder(&buf)
-				e := enc.Encode(cacheErr)
-				if e == nil {
-					c.setKey(queryKey, buf.Bytes(), expire)
-				} else {
-					c.deleteKey(queryKey)
-				}
-			}()
 		} else {
 			c.deleteKey(queryKey)
 		}
-	}
+	}()
 	return dbres, err
 }
 
+// setKey set key in redis and inMemCache
 func (c *Client) setKey(queryKey QueryKey, b []byte, expire time.Duration) {
-	if c.primaryConn.Set(store(queryKey), b, MaxCacheTime).Err() == nil {
+	if c.primaryConn.Set(store(queryKey), b, maxCacheTime).Err() == nil {
 		c.primaryConn.Set(ttl(queryKey), strconv.FormatInt(nowFunc().UTC().Add(expire).Unix(), 10), expire)
 	}
 	if c.inMemCache != nil {
@@ -152,6 +141,7 @@ func (c *Client) setKey(queryKey QueryKey, b []byte, expire time.Duration) {
 	}
 }
 
+// deleteKey delete key in redis and inMemCache
 func (c *Client) deleteKey(queryKey QueryKey) {
 	if e := c.primaryConn.Get(store(queryKey)).Err(); e != redis.Nil {
 		// Delete key if error should not be cached
@@ -163,6 +153,7 @@ func (c *Client) deleteKey(queryKey QueryKey) {
 	}
 }
 
+// broadcastKeyInvalidate pushes key into a list and wait for broadcast
 func (c *Client) broadcastKeyInvalidate(queryKey QueryKey) {
 	c.invalidateMu.Lock()
 	c.invalidateKeys[store(queryKey)] = struct{}{}
@@ -173,6 +164,8 @@ func (c *Client) broadcastKeyInvalidate(queryKey QueryKey) {
 	}
 }
 
+// aggregateSend waits for 1 seconds or list accumulating more than maxInvalidate
+// to send to redis pubsub
 func (c *Client) aggregateSend() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -200,6 +193,7 @@ func (c *Client) aggregateSend() {
 	}
 }
 
+// listenKeyInvalidate subscribe to invalidate key requests and invalidates inmemcache
 func (c *Client) listenKeyInvalidate() {
 	ch := c.pubsub.Channel()
 	for {
@@ -236,11 +230,11 @@ func lock(key QueryKey) string {
 }
 
 func ttl(key QueryKey) string {
-	return store(key) + TTLSuffix
+	return store(key) + ttlSuffix
 }
 
-func returnError(target interface{}, err errors.Error) (interface{}, errors.Error) {
-	// Cast the ret to the nil pointer of same type if it is a pointer
+// returnError cast the ret to the nil pointer of same type if it is a pointer
+func returnError(target interface{}, err error) (interface{}, error) {
 	retReflect := reflect.ValueOf(target)
 	if retReflect.Kind() == reflect.Ptr {
 		value := reflect.New(retReflect.Type())
@@ -250,7 +244,8 @@ func returnError(target interface{}, err errors.Error) (interface{}, errors.Erro
 	return target, err
 }
 
-func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{}, expire time.Duration, f ReadThroughFunc, noCache bool) (interface{}, errors.Error) {
+// Get implements Cache interface
+func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{}, expire time.Duration, f ReadThroughFunc, noCache bool) (interface{}, error) {
 	if c.promCounter != nil {
 		c.promCounter.WithLabelValues("TOTAL").Inc()
 	}
@@ -264,6 +259,7 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 
 	var bRes []byte
 	if c.inMemCache != nil {
+		// Check for inmemcache first
 		bRes, _ = c.inMemCache.Get([]byte(store(queryKey)))
 	}
 	if bRes == nil {
@@ -273,7 +269,7 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 		if e == nil {
 			if len(resList) != 2 {
 				// Should never happen
-				return returnError(target, errors.NewErrorf(errors.CodeRedisFailedToGet, "get list %s not len 2", resList))
+				return returnError(target, ErrInternal)
 			}
 			if resList[0] != nil {
 				res, _ = resList[0].(string)
@@ -292,7 +288,7 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 			// Did not obtain lock, sleep and retry to wait for update
 			select {
 			case <-ctx.Done():
-				return returnError(target, errors.NewErrorf(errors.CodeRequestTimeout, "timeout"))
+				return returnError(target, ErrTimeout)
 			case <-time.After(minSleep):
 				goto retry
 			}
@@ -333,39 +329,29 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 		c.promCounter.WithLabelValues("HIT").Inc()
 	}
 
-	// check if value is err
-	cachedErr := &cacheError{}
-	dec := gob.NewDecoder(bytes.NewBuffer(bRes))
-	e := dec.Decode(cachedErr)
-	if e == nil && !cachedErr.isEmpty() {
-		l := strings.Split(cachedErr.Msg, ":")
-		if len(l) > 1 {
-			cachedErr.Msg = strings.Join(l[1:], ":")
-		}
-		return returnError(target, errors.NewError(cachedErr.Code, cachedErr.Msg))
-	}
-
 	// check for actual value
-	dec = gob.NewDecoder(bytes.NewBuffer(bRes))
+	dec := gob.NewDecoder(bytes.NewBuffer(bRes))
 	value := reflect.ValueOf(target)
 	if value.Kind() != reflect.Ptr {
 		// If target is not a pointer, create a pointer of target type and decode to it
 		t := reflect.New(reflect.PtrTo(reflect.TypeOf(target)))
-		e = dec.Decode(t.Interface())
+		e := dec.Decode(t.Interface())
 		if e != nil {
 			return c.getNoCache(ctx, queryKey, expire, f)
 		}
 		// Dereference and return the underlying target
 		return t.Elem().Elem().Interface(), nil
 	}
-	e = dec.Decode(target)
+	// target is a pointer, decode directly
+	e := dec.Decode(target)
 	if e != nil {
 		return c.getNoCache(ctx, queryKey, expire, f)
 	}
 	return target, nil
 }
 
-func (c *Client) Set(ctx context.Context, invalidateKeys []QueryKey, f ReadThroughFunc, block *[]chan struct{}) (interface{}, errors.Error) {
+// Set implements Cache interface
+func (c *Client) Set(ctx context.Context, invalidateKeys []QueryKey, f ReadThroughFunc, block *[]chan struct{}) (interface{}, error) {
 	// if cond is passed, the process waits until cond is true before invalidating keys
 	res, err := f()
 	if err == nil {
@@ -392,11 +378,11 @@ func (c *Client) Set(ctx context.Context, invalidateKeys []QueryKey, f ReadThrou
 
 type CacheWriteBack struct {
 	Value  interface{}
-	Err    errors.Error
 	Expire time.Duration
 }
 
-func (c *Client) SetWithWriteBack(ctx context.Context, writeBack map[QueryKey]CacheWriteBack, f ReadThroughFunc, block *[]chan struct{}) (interface{}, errors.Error) {
+// SetWithWriteBack implements Cache interface
+func (c *Client) SetWithWriteBack(ctx context.Context, writeBack map[QueryKey]CacheWriteBack, f ReadThroughFunc, block *[]chan struct{}) (interface{}, error) {
 	res, err := f()
 	if err == nil {
 		go func() {
@@ -413,22 +399,9 @@ func (c *Client) SetWithWriteBack(ctx context.Context, writeBack map[QueryKey]Ca
 				}
 			}
 			for k, v := range writeBack {
-				c.getNoCache(ctx, k, v.Expire, func() (interface{}, errors.Error) { return v.Value, v.Err })
+				c.getNoCache(ctx, k, v.Expire, func() (interface{}, error) { return v.Value, nil })
 			}
 		}()
 	}
 	return res, err
-}
-
-func (c *Client) shouldCacheError(err errors.Error) bool {
-	for _, t := range c.cachableErrorTypes {
-		if t == err.CodeType() {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *cacheError) isEmpty() bool {
-	return c.Code == 0 || c.Msg == ""
 }

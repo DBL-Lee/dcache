@@ -4,13 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
-
-	errors "github.com/lino-network/lino-errors"
 
 	"github.com/coocood/freecache"
 	"github.com/go-redis/redis"
@@ -19,17 +18,16 @@ import (
 )
 
 var (
-	dbResponseTime  = 100 * time.Millisecond
-	cacheableErrors = []errors.CodeType{errors.CodeServerInternalError}
+	dbResponseTime = 100 * time.Millisecond
 )
 
 type testSuite struct {
 	suite.Suite
 	redisConn   redis.UniversalClient
 	inMemCache  *freecache.Cache
-	cacheRepo   CacheRepository
+	cacheRepo   Cache
 	inMemCache2 *freecache.Cache
-	cacheRepo2  CacheRepository
+	cacheRepo2  Cache
 	mockRepo    dummyMock
 }
 
@@ -38,19 +36,19 @@ type dummyMock struct {
 }
 
 // ReadThrough
-func (_m *dummyMock) ReadThrough() (interface{}, errors.Error) {
+func (_m *dummyMock) ReadThrough() (interface{}, error) {
 	ret := _m.Called()
 	// Emulate db response time
 	time.Sleep(dbResponseTime)
 
 	r0 := ret.Get(0)
 
-	var r1 errors.Error
-	if rf, ok := ret.Get(1).(func() errors.Error); ok {
+	var r1 error
+	if rf, ok := ret.Get(1).(func() error); ok {
 		r1 = rf()
 	} else {
 		if ret.Get(1) != nil {
-			r1 = ret.Get(1).(errors.Error)
+			r1 = ret.Get(1).(error)
 		}
 	}
 
@@ -58,19 +56,19 @@ func (_m *dummyMock) ReadThrough() (interface{}, errors.Error) {
 }
 
 // WriteThrough
-func (_m *dummyMock) WriteThrough() (interface{}, errors.Error) {
+func (_m *dummyMock) WriteThrough() (interface{}, error) {
 	ret := _m.Called()
 	// Emulate db response time
 	time.Sleep(dbResponseTime)
 
 	r0 := ret.Get(0)
 
-	var r1 errors.Error
-	if rf, ok := ret.Get(1).(func() errors.Error); ok {
+	var r1 error
+	if rf, ok := ret.Get(1).(func() error); ok {
 		r1 = rf()
 	} else {
 		if ret.Get(1) != nil {
-			r1 = ret.Get(1).(errors.Error)
+			r1 = ret.Get(1).(error)
 		}
 	}
 
@@ -83,12 +81,12 @@ func newTestSuite() *testSuite {
 		DB:   10,
 	})
 	inMemCache := freecache.NewCache(1024 * 1024)
-	cacheRepo, e := NewCacheRepo(redisClient, nil, nil, inMemCache, cacheableErrors, time.Second)
+	cacheRepo, e := NewCache(redisClient, nil, nil, inMemCache, time.Second)
 	if e != nil {
 		panic(e)
 	}
 	inMemCache2 := freecache.NewCache(1024 * 1024)
-	cacheRepo2, e := NewCacheRepo(redisClient, nil, nil, inMemCache2, cacheableErrors, time.Second)
+	cacheRepo2, e := NewCache(redisClient, nil, nil, inMemCache2, time.Second)
 	if e != nil {
 		panic(e)
 	}
@@ -135,11 +133,6 @@ func (suite *testSuite) decodeByte(bRes []byte, target interface{}) interface{} 
 	}
 	e := dec.Decode(target)
 	suite.NoError(e)
-	// Use reflect to dereference an interface if it is pointer to array.
-	// Should always be slice instead of array, but just in case.
-	if value.Elem().Type().Kind() == reflect.Slice || value.Elem().Type().Kind() == reflect.Array {
-		return reflect.ValueOf(target).Elem().Interface()
-	}
 	return target
 }
 
@@ -147,14 +140,14 @@ func (suite *testSuite) TestPopulateCache() {
 	queryKey := QueryKey("test")
 	v := "testvalue"
 	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
-	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
 	suite.Equal(v, vget)
 
 	// Second call should not hit db
-	vget, err = suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget, err = suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
@@ -168,7 +161,7 @@ func (suite *testSuite) TestPopulateCache() {
 	suite.Equal(v, suite.decodeByte(vinmem, v))
 
 	// Second pod should not hit db either
-	vget2, err := suite.cacheRepo2.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget2, err := suite.cacheRepo2.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
@@ -179,41 +172,21 @@ func (suite *testSuite) TestPopulateCache() {
 	suite.Equal(v, suite.decodeByte(vinmem2, v))
 }
 
-func (suite *testSuite) TestCachingError() {
-	queryKey := QueryKey("test")
-	type a struct{}
-	var v *a
-	e := errors.NewErrorf(errors.CodeServerInternalError, "internal error")
-	suite.mockRepo.On("ReadThrough").Return(v, e).Once()
-	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
-		return suite.mockRepo.ReadThrough()
-	}, false)
-	suite.Equal(e, err)
-	suite.Equal(v, vget)
-
-	// The second time should return err from cache not db
-	vget, err = suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
-		return suite.mockRepo.ReadThrough()
-	}, false)
-	suite.Equal(e, err)
-	suite.Equal(v, vget)
-}
-
 func (suite *testSuite) TestNotCachingError() {
 	queryKey := QueryKey("test")
 	v := ""
 	// Not cacheable error
-	e := errors.NewErrorf(errors.CodeAPIError, "internal error")
+	e := errors.New("newerror")
 	// Should hit db twice
 	suite.mockRepo.On("ReadThrough").Return(v, e).Twice()
-	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.Equal(e, err)
 	suite.Equal(v, vget)
 
 	// The second time should return err from cache not db
-	vget, err = suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget, err = suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.Equal(e, err)
@@ -230,13 +203,13 @@ func (suite *testSuite) TestConcurrentReadWait() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+		vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 			return suite.mockRepo.ReadThrough()
 		}, false)
 		suite.NoError(err)
 		suite.Equal(v, vget)
 	}()
-	vget2, err := suite.cacheRepo2.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget2, err := suite.cacheRepo2.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
@@ -254,7 +227,7 @@ func (suite *testSuite) TestConcurrentReadWaitTimeout() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+		vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 			return suite.mockRepo.ReadThrough()
 		}, false)
 		suite.NoError(err)
@@ -265,7 +238,7 @@ func (suite *testSuite) TestConcurrentReadWaitTimeout() {
 	ctx, cancel := context.WithCancel(context.Background())
 	// cancel the context
 	cancel()
-	s, err := suite.cacheRepo2.Get(ctx, queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	s, err := suite.cacheRepo2.Get(ctx, queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	// Should get timeout error
@@ -292,14 +265,14 @@ func (suite *testSuite) TestCacheDifferentType() {
 	} {
 		queryKey := QueryKey(fmt.Sprintf("test%d", i))
 		suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
-		vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+		vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 			return suite.mockRepo.ReadThrough()
 		}, false)
 		suite.NoError(err)
 		suite.EqualValues(v, vget)
 
 		// Second call should not hit db
-		vget, err = suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+		vget, err = suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 			return suite.mockRepo.ReadThrough()
 		}, false)
 		suite.NoError(err)
@@ -309,27 +282,27 @@ func (suite *testSuite) TestCacheDifferentType() {
 
 func (suite *testSuite) TestZeroValueErrorReturn() {
 	str := "empty"
-	strret, _ := returnError(str, errors.NewErrorf(errors.CodeAPIError, "any"))
+	strret, _ := returnError(str, errors.New("test"))
 	_ = strret.(string)
 
 	i := 123
-	iret, _ := returnError(i, errors.NewErrorf(errors.CodeAPIError, "any"))
+	iret, _ := returnError(i, errors.New("test"))
 	_ = iret.(int)
 
 	b := true
-	bret, _ := returnError(b, errors.NewErrorf(errors.CodeAPIError, "any"))
+	bret, _ := returnError(b, errors.New("test"))
 	_ = bret.(bool)
 
 	obj := time.Time{}
-	objret, _ := returnError(obj, errors.NewErrorf(errors.CodeAPIError, "any"))
+	objret, _ := returnError(obj, errors.New("test"))
 	_ = objret.(time.Time)
 
 	objptr := &time.Time{}
-	objptrret, _ := returnError(objptr, errors.NewErrorf(errors.CodeAPIError, "any"))
+	objptrret, _ := returnError(objptr, errors.New("test"))
 	_ = objptrret.(*time.Time)
 
 	list := []*time.Time{}
-	listret, _ := returnError(list, errors.NewErrorf(errors.CodeAPIError, "any"))
+	listret, _ := returnError(list, errors.New("test"))
 	_ = listret.([]*time.Time)
 }
 
@@ -338,7 +311,7 @@ func (suite *testSuite) TestConcurrentReadAfterExpire() {
 	v := "testvalueold"
 	// Only one pod should hit db
 	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
-	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, time.Second, func() (interface{}, errors.Error) {
+	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, time.Second, func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
@@ -354,7 +327,7 @@ func (suite *testSuite) TestConcurrentReadAfterExpire() {
 	wg.Add(1)
 	go func() {
 		wg.Done()
-		vget, err := suite.cacheRepo.Get(context.Background(), queryKey, newv, Normal.ToDuration(), func() (interface{}, errors.Error) {
+		vget, err := suite.cacheRepo.Get(context.Background(), queryKey, newv, Normal.ToDuration(), func() (interface{}, error) {
 			return suite.mockRepo.ReadThrough()
 		}, false)
 		suite.NoError(err)
@@ -362,7 +335,7 @@ func (suite *testSuite) TestConcurrentReadAfterExpire() {
 	}()
 	// Make sure cache2 is called later and timeout is within db response time
 	time.Sleep(dbResponseTime / 2)
-	_, err = suite.cacheRepo2.Get(context.Background(), queryKey, newv, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	_, err = suite.cacheRepo2.Get(context.Background(), queryKey, newv, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
@@ -371,7 +344,7 @@ func (suite *testSuite) TestConcurrentReadAfterExpire() {
 
 	time.Sleep(dbResponseTime)
 	// Should get newv afterwards
-	vget, err = suite.cacheRepo.Get(context.Background(), queryKey, newv, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget, err = suite.cacheRepo.Get(context.Background(), queryKey, newv, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
@@ -384,7 +357,7 @@ func (suite *testSuite) TestSet() {
 	v := "testvalueold"
 	// Only one pod should hit db
 	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
-	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
@@ -392,7 +365,7 @@ func (suite *testSuite) TestSet() {
 
 	newv := "testvaluenew"
 	suite.mockRepo.On("WriteThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.Set(context.Background(), []QueryKey{queryKey}, func() (interface{}, errors.Error) {
+	vget, err = suite.cacheRepo.Set(context.Background(), []QueryKey{queryKey}, func() (interface{}, error) {
 		return suite.mockRepo.WriteThrough()
 	}, nil)
 	suite.NoError(err)
@@ -408,7 +381,7 @@ func (suite *testSuite) TestSet() {
 	suite.Equal(freecache.ErrNotFound, e)
 
 	suite.mockRepo.On("ReadThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.Get(context.Background(), queryKey, newv, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget, err = suite.cacheRepo.Get(context.Background(), queryKey, newv, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
@@ -421,7 +394,7 @@ func (suite *testSuite) TestSetWithBlockChan() {
 	v := "testvalueold"
 	// Only one pod should hit db
 	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
-	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
@@ -429,7 +402,7 @@ func (suite *testSuite) TestSetWithBlockChan() {
 
 	newv := "testvaluenew"
 	suite.mockRepo.On("WriteThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.Set(context.Background(), []QueryKey{queryKey}, func() (interface{}, errors.Error) {
+	vget, err = suite.cacheRepo.Set(context.Background(), []QueryKey{queryKey}, func() (interface{}, error) {
 		return suite.mockRepo.WriteThrough()
 	}, &blockchan)
 	suite.NoError(err)
@@ -465,7 +438,7 @@ func (suite *testSuite) TestSetWithWriteBack() {
 	v := "testvalueold"
 	// Only one pod should hit db
 	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
-	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
@@ -477,10 +450,9 @@ func (suite *testSuite) TestSetWithWriteBack() {
 		map[QueryKey]CacheWriteBack{
 			queryKey: CacheWriteBack{
 				Value:  newv,
-				Err:    nil,
 				Expire: Normal.ToDuration(),
 			},
-		}, func() (interface{}, errors.Error) {
+		}, func() (interface{}, error) {
 			return suite.mockRepo.WriteThrough()
 		}, nil)
 	suite.NoError(err)
@@ -496,7 +468,7 @@ func (suite *testSuite) TestSetWithWriteBack() {
 	suite.Equal(newv, suite.decodeByte(vinmem, newv))
 
 	// Should not hit db
-	vget, err = suite.cacheRepo.Get(context.Background(), queryKey, newv, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget, err = suite.cacheRepo.Get(context.Background(), queryKey, newv, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
@@ -509,7 +481,7 @@ func (suite *testSuite) TestSetWithWriteBackWithBlockChan() {
 	v := "testvalueold"
 	// Only one pod should hit db
 	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
-	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
@@ -521,10 +493,9 @@ func (suite *testSuite) TestSetWithWriteBackWithBlockChan() {
 		map[QueryKey]CacheWriteBack{
 			queryKey: CacheWriteBack{
 				Value:  newv,
-				Err:    nil,
 				Expire: Normal.ToDuration(),
 			},
-		}, func() (interface{}, errors.Error) {
+		}, func() (interface{}, error) {
 			return suite.mockRepo.WriteThrough()
 		}, &blockchan)
 	suite.NoError(err)
@@ -559,13 +530,13 @@ func (suite *testSuite) TestInvalidateKeyAcrossPods() {
 	v := "testvalueold"
 	// Only one pod should hit db
 	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
-	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
 	suite.Equal(v, vget)
 
-	vget2, err := suite.cacheRepo2.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, errors.Error) {
+	vget2, err := suite.cacheRepo2.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
 	suite.NoError(err)
@@ -581,7 +552,7 @@ func (suite *testSuite) TestInvalidateKeyAcrossPods() {
 
 	newv := "testvaluenew"
 	suite.mockRepo.On("WriteThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.Set(context.Background(), []QueryKey{queryKey}, func() (interface{}, errors.Error) {
+	vget, err = suite.cacheRepo.Set(context.Background(), []QueryKey{queryKey}, func() (interface{}, error) {
 		return suite.mockRepo.WriteThrough()
 	}, nil)
 	suite.NoError(err)

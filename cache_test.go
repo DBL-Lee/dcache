@@ -19,6 +19,7 @@ import (
 
 var (
 	dbResponseTime = 100 * time.Millisecond
+	waitTime       = 10 * time.Millisecond
 )
 
 type testSuite struct {
@@ -273,6 +274,7 @@ func (suite *testSuite) TestCacheDifferentType() {
 		suite.NoError(err)
 		suite.EqualValues(v, vget)
 
+		time.Sleep(waitTime)
 		// Second call should not hit db
 		vget, err = suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 			return suite.mockRepo.ReadThrough()
@@ -354,6 +356,32 @@ func (suite *testSuite) TestConcurrentReadAfterExpire() {
 	wg.Wait()
 }
 
+func (suite *testSuite) TestInvalidate() {
+	queryKey := QueryKey("test")
+	v := "testvalueold"
+	// Only one pod should hit db
+	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
+	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
+		return suite.mockRepo.ReadThrough()
+	}, false)
+	suite.NoError(err)
+	suite.Equal(v, vget)
+
+	// Wait for key to be created
+	time.Sleep(waitTime)
+	err = suite.cacheRepo.Invalidate(context.Background(), queryKey)
+	suite.NoError(err)
+
+	// Wait for key to be deleted
+	time.Sleep(waitTime)
+	exist, e := suite.redisConn.Exists(store(queryKey), ttl(queryKey)).Result()
+	suite.NoError(e)
+	suite.EqualValues(0, exist)
+
+	_, e = suite.inMemCache.Get([]byte(store(queryKey)))
+	suite.Equal(freecache.ErrNotFound, e)
+}
+
 func (suite *testSuite) TestSet() {
 	queryKey := QueryKey("test")
 	v := "testvalueold"
@@ -365,103 +393,13 @@ func (suite *testSuite) TestSet() {
 	suite.NoError(err)
 	suite.Equal(v, vget)
 
+	time.Sleep(waitTime)
 	newv := "testvaluenew"
-	suite.mockRepo.On("WriteThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.Set(context.Background(), map[QueryKey]*CacheWriteBack{queryKey: nil}, func() (interface{}, error) {
-		return suite.mockRepo.WriteThrough()
-	}, nil)
+	err = suite.cacheRepo.Set(context.Background(), queryKey, newv, Normal.ToDuration())
 	suite.NoError(err)
-	suite.Equal(newv, vget)
-
-	// Wait for key to be deleted
-	time.Sleep(500 * time.Millisecond)
-	exist, e := suite.redisConn.Exists(store(queryKey), ttl(queryKey)).Result()
-	suite.NoError(e)
-	suite.EqualValues(0, exist)
-
-	_, e = suite.inMemCache.Get([]byte(store(queryKey)))
-	suite.Equal(freecache.ErrNotFound, e)
-
-	suite.mockRepo.On("ReadThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.Get(context.Background(), queryKey, newv, Normal.ToDuration(), func() (interface{}, error) {
-		return suite.mockRepo.ReadThrough()
-	}, false)
-	suite.NoError(err)
-	suite.Equal(newv, vget)
-}
-
-func (suite *testSuite) TestSetWithBlockChan() {
-	var blockchan []chan struct{}
-	queryKey := QueryKey("test")
-	v := "testvalueold"
-	// Only one pod should hit db
-	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
-	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
-		return suite.mockRepo.ReadThrough()
-	}, false)
-	suite.NoError(err)
-	suite.Equal(v, vget)
-
-	newv := "testvaluenew"
-	suite.mockRepo.On("WriteThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.Set(context.Background(), map[QueryKey]*CacheWriteBack{queryKey: nil}, func() (interface{}, error) {
-		return suite.mockRepo.WriteThrough()
-	}, &blockchan)
-	suite.NoError(err)
-	suite.Equal(newv, vget)
-
-	// Wait for key to be deleted
-	time.Sleep(500 * time.Millisecond)
-	// Should not be deleted yet
-	exist, e := suite.redisConn.Exists(store(queryKey), ttl(queryKey)).Result()
-	suite.NoError(e)
-	suite.EqualValues(2, exist)
-
-	_, e = suite.inMemCache.Get([]byte(store(queryKey)))
-	suite.NoError(e)
-
-	for _, ch := range blockchan {
-		ch <- struct{}{}
-	}
-
-	// Wait for key to be deleted
-	time.Sleep(500 * time.Millisecond)
-	// After sending signal should be deleted
-	exist, e = suite.redisConn.Exists(store(queryKey), ttl(queryKey)).Result()
-	suite.NoError(e)
-	suite.EqualValues(0, exist)
-
-	_, e = suite.inMemCache.Get([]byte(store(queryKey)))
-	suite.Equal(freecache.ErrNotFound, e)
-}
-
-func (suite *testSuite) TestSetWithWriteBack() {
-	queryKey := QueryKey("test")
-	v := "testvalueold"
-	// Only one pod should hit db
-	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
-	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
-		return suite.mockRepo.ReadThrough()
-	}, false)
-	suite.NoError(err)
-	suite.Equal(v, vget)
-
-	newv := "testvaluenew"
-	suite.mockRepo.On("WriteThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.Set(context.Background(),
-		map[QueryKey]*CacheWriteBack{
-			queryKey: &CacheWriteBack{
-				Value:  newv,
-				Expire: Normal.ToDuration(),
-			},
-		}, func() (interface{}, error) {
-			return suite.mockRepo.WriteThrough()
-		}, nil)
-	suite.NoError(err)
-	suite.Equal(newv, vget)
 
 	// Wait for key to be populated
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(waitTime)
 	vredis := suite.redisConn.Get(store(queryKey)).Val()
 	suite.Equal(newv, suite.decodeByte([]byte(vredis), newv))
 
@@ -477,56 +415,6 @@ func (suite *testSuite) TestSetWithWriteBack() {
 	suite.Equal(newv, vget)
 }
 
-func (suite *testSuite) TestSetWithWriteBackWithBlockChan() {
-	var blockchan []chan struct{}
-	queryKey := QueryKey("test")
-	v := "testvalueold"
-	// Only one pod should hit db
-	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
-	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
-		return suite.mockRepo.ReadThrough()
-	}, false)
-	suite.NoError(err)
-	suite.Equal(v, vget)
-
-	newv := "testvaluenew"
-	suite.mockRepo.On("WriteThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.Set(context.Background(),
-		map[QueryKey]*CacheWriteBack{
-			queryKey: &CacheWriteBack{
-				Value:  newv,
-				Expire: Normal.ToDuration(),
-			},
-		}, func() (interface{}, error) {
-			return suite.mockRepo.WriteThrough()
-		}, &blockchan)
-	suite.NoError(err)
-	suite.Equal(newv, vget)
-
-	// Wait for key to be deleted
-	time.Sleep(500 * time.Millisecond)
-	// Should not be updated yet
-	vredis := suite.redisConn.Get(store(queryKey)).Val()
-	suite.Equal(v, suite.decodeByte([]byte(vredis), v))
-
-	vinmem, e := suite.inMemCache.Get([]byte(store(queryKey)))
-	suite.NoError(e)
-	suite.Equal(v, suite.decodeByte(vinmem, v))
-
-	for _, ch := range blockchan {
-		ch <- struct{}{}
-	}
-
-	// Wait for key to be populated
-	time.Sleep(500 * time.Millisecond)
-	vredis = suite.redisConn.Get(store(queryKey)).Val()
-	suite.Equal(newv, suite.decodeByte([]byte(vredis), newv))
-
-	vinmem, e = suite.inMemCache.Get([]byte(store(queryKey)))
-	suite.NoError(e)
-	suite.Equal(newv, suite.decodeByte(vinmem, newv))
-}
-
 func (suite *testSuite) TestInvalidateKeyAcrossPods() {
 	queryKey := QueryKey("test")
 	v := "testvalueold"
@@ -538,6 +426,7 @@ func (suite *testSuite) TestInvalidateKeyAcrossPods() {
 	suite.NoError(err)
 	suite.Equal(v, vget)
 
+	time.Sleep(waitTime)
 	vget2, err := suite.cacheRepo2.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
 		return suite.mockRepo.ReadThrough()
 	}, false)
@@ -552,13 +441,9 @@ func (suite *testSuite) TestInvalidateKeyAcrossPods() {
 	suite.NoError(e)
 	suite.Equal(v, suite.decodeByte(vinmem, v))
 
-	newv := "testvaluenew"
-	suite.mockRepo.On("WriteThrough").Return(newv, nil).Once()
-	vget, err = suite.cacheRepo.Set(context.Background(), map[QueryKey]*CacheWriteBack{queryKey: nil}, func() (interface{}, error) {
-		return suite.mockRepo.WriteThrough()
-	}, nil)
+	time.Sleep(waitTime)
+	err = suite.cacheRepo.Invalidate(context.Background(), queryKey)
 	suite.NoError(err)
-	suite.Equal(newv, vget)
 
 	// Wait for key to be broadcasted
 	time.Sleep(time.Second)

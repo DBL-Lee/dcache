@@ -45,7 +45,7 @@ var (
 func SetNowFunc(f func() time.Time) { nowFunc = f }
 
 // PassThroughFunc is the actual call to underlying data source
-type PassThroughFunc func() (interface{}, error)
+type PassThroughFunc = func() (interface{}, error)
 
 // Cache defines interface to cache
 type Cache interface {

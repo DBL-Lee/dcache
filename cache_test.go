@@ -82,12 +82,12 @@ func newTestSuite() *testSuite {
 		DB:   10,
 	})
 	inMemCache := freecache.NewCache(1024 * 1024)
-	cacheRepo, e := NewCache(redisClient, nil, nil, inMemCache, time.Second)
+	cacheRepo, e := NewCache("test", redisClient, inMemCache, time.Second)
 	if e != nil {
 		panic(e)
 	}
 	inMemCache2 := freecache.NewCache(1024 * 1024)
-	cacheRepo2, e := NewCache(redisClient, nil, nil, inMemCache2, time.Second)
+	cacheRepo2, e := NewCache("test", redisClient, inMemCache2, time.Second)
 	if e != nil {
 		panic(e)
 	}

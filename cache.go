@@ -5,7 +5,7 @@ import (
 	"context"
 	"encoding/gob"
 	"errors"
-	"math/rand"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -77,7 +77,6 @@ type Cache interface {
 // Client captures redis connection
 type Client struct {
 	primaryConn            redis.UniversalClient
-	replicaConn            []redis.UniversalClient
 	promCounter            *prometheus.CounterVec
 	inMemCache             *freecache.Cache
 	pubsub                 *redis.PubSub
@@ -90,17 +89,20 @@ type Client struct {
 
 // NewCache creates a new redis cache with inmem cache
 func NewCache(
+	appName string,
 	primaryClient redis.UniversalClient,
-	replicaClient []redis.UniversalClient,
-	counter *prometheus.CounterVec,
 	inMemCache *freecache.Cache,
 	readThroughPerKeyLimit time.Duration,
 ) (Cache, error) {
-	rand.Seed(nowFunc().UnixNano())
 	id := uuid.NewV4()
+	counter := prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: fmt.Sprintf("%s_cache", appName),
+		Help: "Cache operations",
+	}, []string{"name"})
+	// Ignore error
+	_ = prometheus.Register(counter)
 	c := &Client{
 		primaryConn:            primaryClient,
-		replicaConn:            replicaClient,
 		promCounter:            counter,
 		id:                     id.String(),
 		invalidateKeys:         make(map[string]struct{}),
@@ -281,9 +283,6 @@ func (c *Client) Get(ctx context.Context, queryKey QueryKey, target interface{},
 		return c.getNoCache(ctx, queryKey, expire, f)
 	}
 	readConn := c.primaryConn
-	if len(c.replicaConn) > 0 {
-		readConn = c.replicaConn[rand.Intn(len(c.replicaConn))]
-	}
 
 	var bRes []byte
 	if c.inMemCache != nil {

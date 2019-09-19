@@ -140,24 +140,26 @@ func (c *Client) getNoCache(ctx context.Context, queryKey QueryKey, expire time.
 		c.promCounter.WithLabelValues("MISS").Inc()
 	}
 	dbres, err := f()
-	go func() {
-		if err == nil {
-			var buf bytes.Buffer
-			enc := gob.NewEncoder(&buf)
-			var e error
-			v := reflect.ValueOf(dbres)
-			if dbres == nil || v.Kind() == reflect.Ptr && v.IsNil() {
-				e = enc.Encode(&nilPlaceholder{})
-			} else {
-				e = enc.Encode(dbres)
-			}
-			if e == nil {
-				c.setKey(queryKey, buf.Bytes(), expire)
-			}
+	if err == nil {
+		var buf bytes.Buffer
+		enc := gob.NewEncoder(&buf)
+		var e error
+		v := reflect.ValueOf(dbres)
+		if dbres == nil || v.Kind() == reflect.Ptr && v.IsNil() {
+			e = enc.Encode(&nilPlaceholder{})
 		} else {
-			c.deleteKey(queryKey)
+			e = enc.Encode(dbres)
 		}
-	}()
+		if e == nil {
+			go func() {
+				c.setKey(queryKey, buf.Bytes(), expire)
+			}()
+		}
+	} else {
+		go func() {
+			c.deleteKey(queryKey)
+		}()
+	}
 	return dbres, err
 }
 

@@ -458,3 +458,24 @@ func (suite *testSuite) TestInvalidateKeyAcrossPods() {
 	_, e = suite.inMemCache2.Get([]byte(store(queryKey)))
 	suite.Equal(freecache.ErrNotFound, e)
 }
+
+func (suite *testSuite) TestModifyingReturnAfterCache() {
+	v := &Dummy{A: 1, B: 2}
+	queryKey := QueryKey("test")
+	suite.mockRepo.On("ReadThrough").Return(v, nil).Once()
+	vget, err := suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
+		return suite.mockRepo.ReadThrough()
+	}, false)
+	suite.NoError(err)
+	suite.EqualValues(v, vget)
+	vget.(*Dummy).A = 3
+
+	time.Sleep(waitTime)
+
+	// Second call should not hit db
+	vget, err = suite.cacheRepo.Get(context.Background(), queryKey, v, Normal.ToDuration(), func() (interface{}, error) {
+		return suite.mockRepo.ReadThrough()
+	}, false)
+	suite.NoError(err)
+	suite.EqualValues(v, vget)
+}
